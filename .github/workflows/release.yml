@@ -1,0 +1,29 @@
+name: Release CloudHunter
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish Windows Standalone
+        run: cd CloudHunter && dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o ../publish
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: publish/CloudHunter.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

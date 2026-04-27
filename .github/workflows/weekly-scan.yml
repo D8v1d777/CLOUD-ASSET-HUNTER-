@@ -1,0 +1,30 @@
+name: Weekly CloudHunter Scan
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Run CloudHunter
+        run: cd CloudHunter && dotnet run
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+
+      - name: Upload New Exposures
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-exposures
+          path: CloudHunter/new_exposed.json
+          if-no-files-found: ignore
