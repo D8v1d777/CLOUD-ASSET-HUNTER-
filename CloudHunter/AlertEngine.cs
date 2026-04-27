@@ -10,6 +10,8 @@ namespace CloudHunter;
 public class AlertEngine
 {
     private static readonly HttpClient _client = new HttpClient();
+    private static readonly Dictionary<string, DateTime> _lastAlertTime = new();
+    private static readonly object _lock = new();
 
     public static async Task FireAlertAsync(List<ValidationResult> diffs)
     {
@@ -31,11 +33,28 @@ public class AlertEngine
 
         foreach (var group in groupedByDomain)
         {
+            // Task 4: Rate limiting per domain (e.g., max 1 alert per 5 minutes per domain)
+            lock (_lock)
+            {
+                if (_lastAlertTime.TryGetValue(group.Key, out var lastTime))
+                {
+                    if (DateTime.UtcNow - lastTime < TimeSpan.FromMinutes(5))
+                    {
+                        Console.WriteLine($"[!] Rate limiting alert for domain {group.Key}. Last alert was {lastTime}.");
+                        continue;
+                    }
+                }
+                _lastAlertTime[group.Key] = DateTime.UtcNow;
+            }
+
             var messageBuilder = new StringBuilder();
             messageBuilder.AppendLine($"🚀 **Domain Intelligence Report: {group.Key}** 🚀");
             messageBuilder.AppendLine("---");
 
-            foreach (var d in group)
+            // Batch alerts: limit to top 10 findings per domain alert to avoid payload size issues (Task 4)
+            var topFindings = group.OrderByDescending(d => d.PriorityScore).Take(10);
+
+            foreach (var d in topFindings)
             {
                 var priorityEmoji = d.PriorityLabel switch {
                     "HIGH" => "🔥",
@@ -43,30 +62,27 @@ public class AlertEngine
                     _ => "⚪"
                 };
 
-                messageBuilder.AppendLine($"{priorityEmoji} **{d.PriorityLabel} PRIORITY** | {d.Cloud}");
+                messageBuilder.AppendLine($"{priorityEmoji} **{d.PriorityLabel}** | {d.Cloud} | {d.Decision}");
                 messageBuilder.AppendLine($"> **URL:** {d.Url}");
-                messageBuilder.AppendLine($"> **Score:** `{d.PriorityScore:P0}` | **Confidence:** `{d.Confidence:P0}` | **Impact:** `{d.ImpactScore:P0}`");
+                messageBuilder.AppendLine($"> **Score:** `{d.PriorityScore:P0}` | **Action:** {d.RecommendedAction}");
                 
-                messageBuilder.AppendLine($"> **Summary:** {d.Evidence.Summary}");
-
-                if (d.Evidence.SensitiveFiles.Any())
+                if (d.PriorityScore >= 0.75)
                 {
-                    messageBuilder.AppendLine("> **Sensitive Files Found:**");
-                    foreach (var file in d.Evidence.SensitiveFiles.Take(5))
-                        messageBuilder.AppendLine($">   - `{file}`");
-                }
-
-                if (d.Evidence.Snippets.Any())
-                {
-                    messageBuilder.AppendLine("> **Data Snippets:**");
-                    foreach (var snippet in d.Evidence.Snippets)
+                    messageBuilder.AppendLine($"> **Summary:** {d.Evidence.Summary}");
+                    if (d.Evidence.SensitiveFiles.Any())
                     {
-                        var cleanSnippet = snippet.Content.Replace("`", "'").Replace("\n", " ").Replace("\r", "");
-                        messageBuilder.AppendLine($">   - `{snippet.Filename}`: ```{cleanSnippet}```");
+                        messageBuilder.AppendLine("> **Sensitive Files Found:**");
+                        foreach (var file in d.Evidence.SensitiveFiles.Take(3))
+                            messageBuilder.AppendLine($">   - `{file}`");
                     }
                 }
                 
                 messageBuilder.AppendLine("---");
+            }
+
+            if (group.Count() > 10)
+            {
+                messageBuilder.AppendLine($"*Note: {group.Count() - 10} additional findings for this domain were batched and saved to DB.*");
             }
 
             var payload = new { content = messageBuilder.ToString() };

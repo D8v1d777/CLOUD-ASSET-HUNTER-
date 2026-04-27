@@ -7,12 +7,35 @@ namespace CloudHunter;
 
 public class CloudValidator
 {
-    public static async Task<ValidationResult> ValidateAsync(HttpResponseMessage resp, string url, string cloud, HttpClient client)
+    private static readonly Dictionary<string, double> _signalDampeners = new();
+    private static readonly object _dampenerLock = new();
+
+    public static void ApplySignalDampener(string signalName, double dampener)
     {
+        lock (_dampenerLock)
+        {
+            _signalDampeners[signalName] = Math.Clamp(dampener, 0.1, 1.0);
+        }
+    }
+
+    public static async Task<ValidationResult> ValidateAsync(HttpResponseMessage resp, string url, string cloud, HttpClient client, Dictionary<string, (int FP, int Total)>? metrics = null)
+    {
+        var headers = resp.Headers.ToDictionary(h => h.Key, h => string.Join(", ", h.Value));
+        
+        // Stage 1: Quick Header/Status Validation (Performance Task 5)
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound || resp.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            // Even 403 can be interesting, but 404 is usually a dead end unless it's a specific cloud error
+            if (resp.StatusCode == System.Net.HttpStatusCode.NotFound && !headers.ContainsKey("x-ms-error-code") && !headers.ContainsKey("x-amz-request-id"))
+            {
+                 return new ValidationResult { Url = url, Confidence = 0, Evidence = new Evidence { Summary = "Not Found" } };
+            }
+        }
+
+        // Stage 2: Body Parsing
         var body = await resp.Content.ReadAsStringAsync();
         double confidence = 0;
         var interestingFiles = new List<string>();
-        var headers = resp.Headers.ToDictionary(h => h.Key, h => string.Join(", ", h.Value));
 
         // False Positive Elimination (Extended)
         var fpPatterns = new[] { "CloudFront", "cloudflare", "Please verify you are a human", "404 Not Found", "Access Denied", "NoSuchKey" };
@@ -62,19 +85,106 @@ public class CloudValidator
             }
         }
 
-        // Task 2: Normalize Multi-Signal Impact Scoring
+        // Task 3: Normalize Multi-Signal Impact Scoring with Bounded Weights (Task 1)
         var signalScores = CalculateSignalScores(interestingFiles, headers, body);
-        var impact = (signalScores["keyword"] * 0.4) + (signalScores["entropy"] * 0.2) + (signalScores["volume"] * 0.2) + (signalScores["header"] * 0.2);
+        
+        // Apply Self-Correction Dampeners
+        lock (_dampenerLock)
+        {
+            foreach (var kvp in _signalDampeners)
+            {
+                if (signalScores.ContainsKey(kvp.Key))
+                {
+                    signalScores[kvp.Key] *= kvp.Value;
+                }
+            }
+        }
+
+        // Task 5: Feedback Loop - Adjust signal influence based on historical FP rate
+        if (metrics != null)
+        {
+            foreach (var signal in signalScores.Keys.ToList())
+            {
+                if (metrics.TryGetValue(signal, out var m) && m.Total > 20)
+                {
+                    double fpRate = (double)m.FP / m.Total;
+                    // Dampen the signal score if it has a high FP rate
+                    // Influence = (1 - FP_Rate)^2
+                    double influence = Math.Pow(1.0 - fpRate, 2);
+                    signalScores[signal] *= influence;
+                }
+            }
+        }
+
+        // Task 1: Prevent scoring drift with bounded weights
+        // Weights are hardcoded to fixed values that sum to 1.0, ensuring stability
+        const double keywordWeight = 0.4;
+        const double entropyWeight = 0.2;
+        const double volumeWeight = 0.2;
+        const double headerWeight = 0.2;
+
+        var baseImpact = (signalScores["keyword"] * keywordWeight) + 
+                         (signalScores["entropy"] * entropyWeight) + 
+                         (signalScores["volume"] * volumeWeight) + 
+                         (signalScores["header"] * headerWeight);
+
+        // Task: Signal Correlation Logic
+        double correlationBoost = 0;
+        var filesLower = interestingFiles.Select(f => f.ToLower()).ToList();
+
+        // Rule 1: .env + high entropy → critical
+        if (filesLower.Any(f => f.Contains(".env")) && signalScores["entropy"] > 0.5)
+            correlationBoost += 0.20;
+
+        // Rule 2: backup.sql + large volume → critical
+        if (filesLower.Any(f => f.Contains("backup.sql")) && signalScores["volume"] > 0.5)
+            correlationBoost += 0.20;
+
+        // Rule 3: public access (high confidence) + sensitive filenames → critical
+        if (confidence > 0.9 && signalScores["keyword"] > 0.8)
+            correlationBoost += 0.15;
+
+        // Rule 4: keyword reinforcement
+        if (signalScores["keyword"] > 0.7 && signalScores["entropy"] > 0.6)
+            correlationBoost += 0.10;
+
+        var impact = baseImpact + correlationBoost;
+
+        // Prevent false positives: If only one weak signal → reduce influence
+        int activeSignals = signalScores.Values.Count(v => v > 0.25);
+        if (activeSignals <= 1 && impact < 0.5)
+        {
+            impact *= 0.5; // Dampen isolated signals that aren't inherently strong
+        }
+        
         impact = Math.Clamp(impact, 0, 1.0);
 
         // Task 3: Improve Priority Scoring with Confidence Gating
         double priority = impact * confidence;
-        if (confidence < 0.5) priority *= 0.1; // Aggressive gating for low confidence
+        if (confidence < 0.5) priority *= 0.1;
 
         string priorityLabel = priority >= 0.75 ? "HIGH" : (priority >= 0.40 ? "MEDIUM" : "LOW");
 
-        // Task 4: Structured Evidence Object
-        var evidence = await BuildStructuredEvidence(url, interestingFiles, headers, body, client);
+        // Task 6: Decision/Action Layer
+        string decision = priority >= 0.75 ? "IMMEDIATE_TRIAGE" : (priority >= 0.40 ? "REVIEW_REQUIRED" : "MONITOR");
+        string recommendedAction = decision switch
+        {
+            "IMMEDIATE_TRIAGE" => "CRITICAL: Secure bucket/container immediately. Review sensitive snippets for credentials or keys.",
+            "REVIEW_REQUIRED" => "WARNING: Verify if exposure is intentional. Check for internal non-sensitive data exposure.",
+            "MONITOR" => "INFO: No immediate action required. Asset added to baseline monitoring list.",
+            _ => "UNKNOWN: Requires manual investigation."
+        };
+
+        // Stage 3: Expensive Evidence Building (Only if priority > 0.1)
+        Evidence evidence;
+        if (priority > 0.1)
+        {
+            evidence = await BuildStructuredEvidence(url, interestingFiles, headers, body, client);
+        }
+        else
+        {
+            evidence = new Evidence { Summary = "Low priority asset, detailed evidence skipped.", Filenames = interestingFiles.Take(10).ToList() };
+        }
 
         return new ValidationResult 
         { 
@@ -85,7 +195,9 @@ public class CloudValidator
             PriorityScore = priority,
             PriorityLabel = priorityLabel,
             Evidence = evidence,
-            SignalScores = signalScores
+            SignalScores = signalScores,
+            Decision = decision,
+            RecommendedAction = recommendedAction
         };
     }
 
@@ -113,8 +225,12 @@ public class CloudValidator
         if (headers.ContainsKey("X-Internal-ID") || headers.ContainsKey("X-Powered-By") || headers.ContainsKey("Server")) headerScore += 0.6;
         scores["header"] = Math.Clamp(headerScore, 0, 1.0);
 
-        // 4. Entropy Score (Simple length-based proxy for data density if no files listable)
-        scores["entropy"] = files.Count == 0 ? Math.Clamp(body.Length / 10000.0, 0, 1.0) : 0;
+        // 4. Entropy Score (Task: Correlation support)
+        // Always calculate entropy proxy from body or filenames to support correlation logic
+        double entropyProxy = files.Count > 0 
+            ? Math.Clamp(string.Join("", files).Length / 5000.0, 0, 1.0) 
+            : Math.Clamp(body.Length / 10000.0, 0, 1.0);
+        scores["entropy"] = entropyProxy;
 
         return scores;
     }
@@ -139,8 +255,11 @@ public class CloudValidator
                 if (resp.IsSuccessStatusCode)
                 {
                     var content = await resp.Content.ReadAsByteArrayAsync();
-                    var snippet = System.Text.Encoding.UTF8.GetString(content.Take(256).ToArray());
-                    evidence.Snippets.Add(new Snippet { Filename = sensitiveFile, Content = snippet });
+                    // Task 3: Sanitize and optimize evidence storage
+                    // Limit snippet size to 512 bytes and sanitize common secrets
+                    var snippetRaw = System.Text.Encoding.UTF8.GetString(content.Take(512).ToArray());
+                    var sanitizedSnippet = SanitizeSnippet(snippetRaw);
+                    evidence.Snippets.Add(new Snippet { Filename = sensitiveFile, Content = sanitizedSnippet });
                 }
             }
             catch { }
@@ -162,6 +281,29 @@ public class CloudValidator
             : $"Unauthenticated access discovered at {url} with moderate impact signals.";
 
         return evidence;
+    }
+
+    private static string SanitizeSnippet(string content)
+    {
+        if (string.IsNullOrEmpty(content)) return "";
+        
+        // Simple sanitization for common secret patterns to prevent sensitive data leakage in storage/alerts
+        var sanitized = content;
+        var patterns = new[] 
+        { 
+            @"(?i)password\s*[:=]\s*[^\s,;]+",
+            @"(?i)secret\s*[:=]\s*[^\s,;]+",
+            @"(?i)key\s*[:=]\s*[^\s,;]+",
+            @"(?i)token\s*[:=]\s*[^\s,;]+",
+            @"(?i)api_key\s*[:=]\s*[^\s,;]+"
+        };
+
+        foreach (var p in patterns)
+        {
+            sanitized = System.Text.RegularExpressions.Regex.Replace(sanitized, p, m => m.Value.Split(new[] { ':', '=' }, 2)[0] + ": [REDACTED]");
+        }
+
+        return sanitized;
     }
 
     private static void ExtractS3Files(string xml, List<string> files)
@@ -215,6 +357,8 @@ public record ValidationResult
     public string PriorityLabel { get; init; } = "LOW";
     public Evidence Evidence { get; init; } = new();
     public Dictionary<string, double> SignalScores { get; init; } = new();
+    public string Decision { get; init; } = "MONITOR";
+    public string RecommendedAction { get; init; } = "";
 }
 
 public class Evidence
