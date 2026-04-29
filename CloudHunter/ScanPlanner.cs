@@ -1,7 +1,7 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Channels;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -9,96 +9,97 @@ namespace CloudHunter
 {
     public enum ScanTier
     {
-        Tier1_HighHistorical, // 50%
-        Tier2_HighRelevance,  // 30%
-        Tier3_AutoSeed        // 20%
+        Tier1_HighHistorical = 0,
+        Tier2_HighRelevance = 1,
+        Tier3_AutoSeed = 2
     }
 
-    public record ScanTarget(string Url, string Cloud, ScanTier Tier);
+    public record ScanTarget(string Url, string Cloud, ScanTier Tier, DateTime QueuedAt);
+
+    public class TierMetrics
+    {
+        public long ProcessedCount;
+        public long SuccessCount;
+        public long FailureCount;
+        public long TotalWaitMs;
+    }
 
     public class ScanPlanner
     {
-        private readonly ConcurrentQueue<ScanTarget> _tier1Queue = new();
-        private readonly ConcurrentQueue<ScanTarget> _tier2Queue = new();
-        private readonly ConcurrentQueue<ScanTarget> _tier3Queue = new();
+        // Memory Safety: Hard bounds for 175k total in-flight targets
+        private const int CapT1 = 100_000;
+        private const int CapT2 = 50_000;
+        private const int CapT3 = 25_000;
 
-        private readonly Dictionary<ScanTier, double> _weights = new()
+        private readonly Channel<ScanTarget>[] _channels;
+        private readonly TierMetrics[] _metrics;
+        
+        private volatile ScanTier[] _strideTable;
+        private long _globalSequenceIndex = 0;
+        private long _droppedTier3Count = 0;
+        private double _lastPressure = -1.0;
+        private long _totalQueued = 0;
+
+        public int TotalQueued => (int)Interlocked.Read(ref _totalQueued);
+
+        public ScanPlanner()
         {
-            { ScanTier.Tier1_HighHistorical, 0.50 },
-            { ScanTier.Tier2_HighRelevance, 0.30 },
-            { ScanTier.Tier3_AutoSeed, 0.20 }
-        };
-
-        private readonly Dictionary<ScanTier, int> _activeCounts = new()
-        {
-            { ScanTier.Tier1_HighHistorical, 0 },
-            { ScanTier.Tier2_HighRelevance, 0 },
-            { ScanTier.Tier3_AutoSeed, 0 }
-        };
-
-        private readonly Dictionary<ScanTier, (int success, int total)> _stats = new()
-        {
-            { ScanTier.Tier1_HighHistorical, (0, 0) },
-            { ScanTier.Tier2_HighRelevance, (0, 0) },
-            { ScanTier.Tier3_AutoSeed, (0, 0) }
-        };
-
-        private readonly object _lock = new();
-        private readonly SemaphoreSlim _availableSignal = new(0);
-        private int _totalQueued = 0;
-
-        public int TotalQueued => _totalQueued;
-
-        public void Enqueue(ScanTarget target)
-        {
-            switch (target.Tier)
+            _channels = new[]
             {
-                case ScanTier.Tier1_HighHistorical: _tier1Queue.Enqueue(target); break;
-                case ScanTier.Tier2_HighRelevance: _tier2Queue.Enqueue(target); break;
-                case ScanTier.Tier3_AutoSeed: _tier3Queue.Enqueue(target); break;
+                Channel.CreateBounded<ScanTarget>(new BoundedChannelOptions(CapT1) { SingleReader = false, FullMode = BoundedChannelFullMode.Wait }),
+                Channel.CreateBounded<ScanTarget>(new BoundedChannelOptions(CapT2) { SingleReader = false, FullMode = BoundedChannelFullMode.Wait }),
+                Channel.CreateBounded<ScanTarget>(new BoundedChannelOptions(CapT3) { SingleReader = false, FullMode = BoundedChannelFullMode.DropWrite })
+            };
+
+            _metrics = new[] { new TierMetrics(), new TierMetrics(), new TierMetrics() };
+            _strideTable = GenerateStrideTable(0.0);
+        }
+
+        public async ValueTask EnqueueAsync(ScanTarget target, double pressure, CancellationToken ct = default)
+        {
+            // 1. Dynamic Weight Shifting based on System Pressure
+            if (Math.Abs(_lastPressure - pressure) > 0.05)
+            {
+                _strideTable = GenerateStrideTable(pressure);
+                _lastPressure = pressure;
             }
+
+            // 2. Stable Backpressure: Prune exploratory data when system is under high stress
+            if (target.Tier == ScanTier.Tier3_AutoSeed && pressure > 0.75)
+            {
+                Interlocked.Increment(ref _droppedTier3Count);
+                return;
+            }
+
+            var channel = _channels[(int)target.Tier];
+            if (!channel.Writer.TryWrite(target))
+            {
+                await channel.Writer.WriteAsync(target, ct);
+            }
+
             Interlocked.Increment(ref _totalQueued);
-            _availableSignal.Release();
         }
 
-        public void ApplyWeightOverride(ScanTier tier, double weight)
-        {
-            lock (_lock)
-            {
-                _weights[tier] = Math.Clamp(weight, 0.01, 0.90);
-                // Re-normalize other weights if needed (simplified here)
-            }
-        }
-
-        public async Task<ScanTarget?> GetNextAsync(int globalLimit, CancellationToken ct = default)
+        public async Task<ScanTarget?> GetNextAsync(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
-                await _availableSignal.WaitAsync(ct);
-
-                lock (_lock)
+                if (Interlocked.Read(ref _totalQueued) == 0)
                 {
-                    var tier = SelectTier(globalLimit);
-                    if (tier == null)
-                    {
-                        // No tier is suitable or queues are empty
-                        // Note: availableSignal might have been released but queues are empty due to race conditions
-                        continue;
-                    }
+                    await Task.WhenAny(_channels.Select(c => c.Reader.WaitToReadAsync(ct).AsTask()));
+                }
 
-                    ScanTarget? target = null;
-                    bool dequeued = tier switch
-                    {
-                        ScanTier.Tier1_HighHistorical => _tier1Queue.TryDequeue(out target),
-                        ScanTier.Tier2_HighRelevance => _tier2Queue.TryDequeue(out target),
-                        ScanTier.Tier3_AutoSeed => _tier3Queue.TryDequeue(out target),
-                        _ => false
-                    };
+                var sequence = Interlocked.Increment(ref _globalSequenceIndex);
+                var preferredTier = (int)_strideTable[sequence % 100];
 
-                    if (dequeued && target != null)
+                // Final Scheduling Model: Deterministic Stride with Fair Sequential Fallback
+                for (int i = 0; i < 3; i++)
+                {
+                    int currentTier = (preferredTier + i) % 3;
+                    if (_channels[currentTier].Reader.TryRead(out var target))
                     {
-                        _activeCounts[tier.Value]++;
                         Interlocked.Decrement(ref _totalQueued);
+                        UpdateMetrics(target);
                         return target;
                     }
                 }
@@ -106,93 +107,61 @@ namespace CloudHunter
             return null;
         }
 
-        private ScanTier? SelectTier(int globalLimit)
+        private void UpdateMetrics(ScanTarget target)
         {
-            // Calculate target counts based on weights
-            var tierTargets = _weights.ToDictionary(
-                kvp => kvp.Key,
-                kvp => (int)Math.Max(1, globalLimit * kvp.Value)
-            );
-
-            // Priority 1: Pick from tiers that are under their allocated target
-            var candidates = _weights.Keys
-                .Where(t => IsTierAvailable(t))
-                .OrderByDescending(t => (double)(tierTargets[t] - _activeCounts[t]) / tierTargets[t])
-                .ToList();
-
-            if (candidates.Any())
-            {
-                // Return the tier that is most "hungry" (furthest from its target percentage)
-                return candidates.First();
-            }
-
-            // Priority 2: If all are over target (e.g. some tiers are empty), just pick by priority
-            if (!_tier1Queue.IsEmpty) return ScanTier.Tier1_HighHistorical;
-            if (!_tier2Queue.IsEmpty) return ScanTier.Tier2_HighRelevance;
-            if (!_tier3Queue.IsEmpty) return ScanTier.Tier3_AutoSeed;
-
-            return null;
-        }
-
-        private bool IsTierAvailable(ScanTier tier)
-        {
-            return tier switch
-            {
-                ScanTier.Tier1_HighHistorical => !_tier1Queue.IsEmpty,
-                ScanTier.Tier2_HighRelevance => !_tier2Queue.IsEmpty,
-                ScanTier.Tier3_AutoSeed => !_tier3Queue.IsEmpty,
-                _ => false
-            };
+            var m = _metrics[(int)target.Tier];
+            Interlocked.Increment(ref m.ProcessedCount);
+            Interlocked.Add(ref m.TotalWaitMs, (long)(DateTime.UtcNow - target.QueuedAt).TotalMilliseconds);
         }
 
         public void RecordResult(ScanTier tier, bool success)
         {
-            lock (_lock)
-            {
-                _activeCounts[tier]--;
-                var current = _stats[tier];
-                _stats[tier] = (current.success + (success ? 1 : 0), current.total + 1);
-
-                AdaptWeights();
-            }
+            var m = _metrics[(int)tier];
+            if (success) Interlocked.Increment(ref m.SuccessCount);
+            else Interlocked.Increment(ref m.FailureCount);
         }
 
-        private void AdaptWeights()
+        private ScanTier[] GenerateStrideTable(double pressure)
         {
-            // Task 3: Real-time adaptation
-            // Only adapt after a reasonable sample size per tier (e.g., 20)
-            foreach (var tier in _stats.Keys.ToList())
+            // Adjust weights based on system pressure: shift exploratory bandwidth to historical success
+            int t1Count = (int)(50 + (35 * pressure)); // 50% -> 85%
+            int t2Count = (int)(30 - (15 * pressure)); // 30% -> 15%
+            int t3Count = 100 - t1Count - t2Count;
+
+            var table = new ScanTier[100];
+            for (int i = 0; i < 100; i++)
             {
-                if (_stats[tier].total < 20) continue;
-
-                double hitRate = (double)_stats[tier].success / _stats[tier].total;
-
-                if (tier == ScanTier.Tier1_HighHistorical && hitRate < 0.02)
-                {
-                    // Tier 1 failing -> shift 5% to Tier 2
-                    if (_weights[ScanTier.Tier1_HighHistorical] > 0.20)
-                    {
-                        _weights[ScanTier.Tier1_HighHistorical] -= 0.05;
-                        _weights[ScanTier.Tier2_HighRelevance] += 0.05;
-                        ResetStats(tier);
-                    }
-                }
-                else if (tier == ScanTier.Tier3_AutoSeed && hitRate > 0.10)
-                {
-                    // Tier 3 spiking -> shift 5% from Tier 2 to Tier 3
-                    if (_weights[ScanTier.Tier2_HighRelevance] > 0.10)
-                    {
-                        _weights[ScanTier.Tier2_HighRelevance] -= 0.05;
-                        _weights[ScanTier.Tier3_AutoSeed] += 0.05;
-                        ResetStats(tier);
-                    }
-                }
+                if (i < t1Count) table[i] = ScanTier.Tier1_HighHistorical;
+                else if (i < t1Count + t2Count) table[i] = ScanTier.Tier2_HighRelevance;
+                else table[i] = ScanTier.Tier3_AutoSeed;
             }
+
+            // Use Fisher-Yates shuffle for O(n) deterministic distribution
+            var rng = new Random(42);
+            for (int i = table.Length - 1; i > 0; i--)
+            {
+                int k = rng.Next(i + 1);
+                var temp = table[k];
+                table[k] = table[i];
+                table[i] = temp;
+            }
+
+            return table;
         }
 
-        private void ResetStats(ScanTier tier)
+        public Dictionary<string, long> GetObservabilityMetrics() => new() {
+            { "T1_Depth", _channels[0].Reader.Count },
+            { "T2_Depth", _channels[1].Reader.Count },
+            { "T3_Depth", _channels[2].Reader.Count },
+            { "Dropped_T3", Interlocked.Read(ref _droppedTier3Count) },
+            { "AvgWait_T1_Ms", GetAvgWait(0) }
+        };
+
+        private long GetAvgWait(int tierIdx)
         {
-            _stats[tier] = (0, 0);
+            var m = _metrics[tierIdx];
+            var processed = Interlocked.Read(ref m.ProcessedCount);
+            return processed == 0 ? 0 : Interlocked.Read(ref m.TotalWaitMs) / processed;
         }
     }
 }

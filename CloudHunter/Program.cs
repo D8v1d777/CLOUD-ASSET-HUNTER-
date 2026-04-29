@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Net.Security;
+using System.Collections.Concurrent;
 
 namespace CloudHunter;
 
@@ -77,22 +78,15 @@ class Program
                     {
                         if (string.IsNullOrWhiteSpace(w)) continue;
                         
-                        // AWS S3
-                        planner.Enqueue(new ScanTarget($"https://{w}.{st}.s3.amazonaws.com", "AWS_S3", tier));
+                        await planner.EnqueueAsync(new ScanTarget($"https://{w}.{st}.s3.amazonaws.com", "AWS_S3", tier, DateTime.UtcNow), concurrencyManager.PressureRatio);
                         
-                        // Azure Blob
                         var cleanTarget = st.Replace(".", "");
                         if (cleanTarget.Length >= 3 && cleanTarget.Length <= 24)
                         {
-                            planner.Enqueue(new ScanTarget($"https://{cleanTarget}.blob.core.windows.net/{w}?restype=container&comp=list", "AZURE_BLOB", tier));
+                            await planner.EnqueueAsync(new ScanTarget($"https://{cleanTarget}.blob.core.windows.net/{w}?restype=container&comp=list", "AZURE_BLOB", tier, DateTime.UtcNow), concurrencyManager.PressureRatio);
                         }
                         
-                        // GCP GCS
-                        planner.Enqueue(new ScanTarget($"https://storage.googleapis.com/storage/v1/b/{w}-{st}/o", "GCP_GCS", tier));
-                        planner.Enqueue(new ScanTarget($"https://storage.googleapis.com/storage/v1/b/{st}-{w}/o", "GCP_GCS", tier));
-
-                        // Backpressure if planner is too full (e.g. 50k targets)
-                        if (planner.TotalQueued > 50000) await Task.Delay(100);
+                        await planner.EnqueueAsync(new ScanTarget($"https://storage.googleapis.com/storage/v1/b/{w}-{st}/o", "GCP_GCS", tier, DateTime.UtcNow), concurrencyManager.PressureRatio);
                     }
                 }
             }
@@ -126,86 +120,81 @@ class Program
         var resultsLock = new object();
         var cts = new CancellationTokenSource();
 
-        var consumerTask = Task.Run(async () =>
+        // Dispatcher using a fixed worker pool for performance and memory stability.
+        // This avoids spawning millions of tasks and prevents the memory leak in the 'tasks' list.
+        var workerCount = 200; // Aligned with AdaptiveConcurrencyManager max
+        var workers = Enumerable.Range(0, workerCount).Select(_ => Task.Run(async () =>
         {
-            var tasks = new List<Task>();
-            
-            while (!generatorTask.IsCompleted || planner.TotalQueued > 0)
+            var rand = new Random();
+            while (!cts.IsCancellationRequested)
             {
-                var item = await planner.GetNextAsync(concurrencyManager.CurrentLimit, cts.Token);
+                var item = await planner.GetNextAsync(cts.Token);
                 if (item == null) break;
 
                 await concurrencyManager.WaitAsync();
                 await domainThrottle.WaitAsync(item.Url);
-                
-                tasks.Add(Task.Run(async () =>
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                bool success = false;
+                try
                 {
-                    // Periodic self-correction check (e.g. every 1000 requests)
+                    var client = clients[rand.Next(clients.Count)];
+                    using var req = new HttpRequestMessage(HttpMethod.Get, item.Url);
+                    req.Headers.TryAddWithoutValidation("User-Agent", UserAgents[rand.Next(UserAgents.Length)]);
+                    req.Headers.TryAddWithoutValidation("Accept", "*/*");
+
+                    var res = await client.SendAsync(req, cts.Token);
+                    success = true;
+
+                    if ((int)res.StatusCode is 200 or 403)
+                    {
+                        var validation = await CloudValidator.ValidateAsync(res, item.Url, item.Cloud, client, signalMetrics);
+                        if (validation.Confidence >= 0.50)
+                        {
+                            lock (resultsLock)
+                            {
+                                results.Add(validation);
+                                tracker.UpsertAsset(validation, "OPEN");
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    var failureType = FailureClassifier.Classify(ex);
+                    metrics.RecordRequest(sw.ElapsedMilliseconds, false, failureType);
+                    concurrencyManager.RecordResult(false, failureType);
+                    tracker.LogFailure(domainThrottle.GetDomain(item.Url), failureType);
+                }
+                finally
+                {
+                    sw.Stop();
+                    if (success)
+                    {
+                        metrics.RecordRequest(sw.ElapsedMilliseconds, true);
+                        concurrencyManager.RecordResult(true);
+                        tracker.UpdateDomainStats(domainThrottle.GetDomain(item.Url), true);
+                    }
+                    else
+                    {
+                        tracker.UpdateDomainStats(domainThrottle.GetDomain(item.Url), false);
+                    }
+
+                    planner.RecordResult(item.Tier, success);
+                    metrics.UpdateConcurrency(concurrencyManager.CurrentLimit);
+                    domainThrottle.Release(item.Url);
+                    concurrencyManager.Release();
+
                     if (metrics.TotalRequests % 1000 == 0 && metrics.TotalRequests > 0)
                     {
                         var health = SystemHealthAnalyzer.Analyze(metrics, results.Count, signalMetrics);
                         correctionEngine.ApplyCorrections(health);
                     }
-
-                    var sw = System.Diagnostics.Stopwatch.StartNew();
-                    bool success = false;
-                    try
-                    {
-                        var rand = new Random();
-                        var client = clients[rand.Next(clients.Count)];
-                        
-                        using var req = new HttpRequestMessage(HttpMethod.Get, item.Url);
-                        req.Headers.TryAddWithoutValidation("User-Agent", UserAgents[rand.Next(UserAgents.Length)]);
-                        req.Headers.TryAddWithoutValidation("Accept", "*/*");
-                        
-                        var res = await client.SendAsync(req);
-                        success = true;
-                        var status = (int)res.StatusCode;
-                        
-                        if (status == 200 || status == 403)
-                        {
-                            var validation = await CloudValidator.ValidateAsync(res, item.Url, item.Cloud, client, signalMetrics);
-                            if (validation.Confidence >= 0.50)
-                            {
-                                lock(resultsLock)
-                                {
-                                    results.Add(validation);
-                                    tracker.UpsertAsset(validation, "OPEN");
-                                }
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        var failureType = FailureClassifier.Classify(ex);
-                        sw.Stop();
-                        metrics.RecordRequest(sw.ElapsedMilliseconds, false, failureType);
-                        concurrencyManager.RecordResult(false, failureType);
-                        tracker.LogFailure(domainThrottle.GetDomain(item.Url), failureType);
-                    }
-                    finally
-                    {
-                        if (success)
-                        {
-                            sw.Stop();
-                            metrics.RecordRequest(sw.ElapsedMilliseconds, true);
-                            concurrencyManager.RecordResult(true);
-                            tracker.UpdateDomainStats(domainThrottle.GetDomain(item.Url), true);
-                        }
-                        else
-                        {
-                            tracker.UpdateDomainStats(domainThrottle.GetDomain(item.Url), false);
-                        }
-                        
-                        planner.RecordResult(item.Tier, success); // Feedback to ScanPlanner
-                        metrics.UpdateConcurrency(concurrencyManager.CurrentLimit);
-                        domainThrottle.Release(item.Url);
-                        concurrencyManager.Release();
-                    }
-                }));
+                }
             }
-            await Task.WhenAll(tasks);
-        });
+        })).ToArray();
+
+        var consumerTask = Task.WhenAll(workers);
 
         await Task.WhenAll(generatorTask, consumerTask);
 
@@ -289,15 +278,13 @@ public class SystemMetrics
     private long _failedRequests = 0;
     private long _totalLatencyMs = 0;
     private int _activeConcurrency = 0;
-    private readonly object _lock = new();
+    private readonly ConcurrentDictionary<string, long> _failureCounts = new();
 
     public long TotalRequests => Interlocked.Read(ref _totalRequests);
     public long SuccessfulRequests => Interlocked.Read(ref _successfulRequests);
     public long TotalLatencyMs => Interlocked.Read(ref _totalLatencyMs);
-    public Dictionary<string, int> FailureCounts 
-    {
-        get { lock(_lock) { return new Dictionary<string, int>(_failureCounts); } }
-    }
+    
+    public IReadOnlyDictionary<string, long> FailureCounts => _failureCounts;
 
     public void RecordRequest(long latencyMs, bool success, string errorType = "None")
     {
@@ -306,15 +293,10 @@ public class SystemMetrics
         else 
         {
             Interlocked.Increment(ref _failedRequests);
-            lock (_lock)
-            {
-                _failureCounts[errorType] = _failureCounts.GetValueOrDefault(errorType) + 1;
-            }
+            _failureCounts.AddOrUpdate(errorType, 1, (_, count) => count + 1);
         }
         Interlocked.Add(ref _totalLatencyMs, latencyMs);
     }
-
-    private readonly Dictionary<string, int> _failureCounts = new();
 
     public void UpdateConcurrency(int count) => _activeConcurrency = count;
 
@@ -365,17 +347,19 @@ public class AdaptiveConcurrencyManager
     private readonly int _maxLimit;
     private readonly SemaphoreSlim _semaphore;
     private int _consecutiveSuccesses = 0;
+    private int _reductionDeficit = 0;
     private readonly object _lock = new();
     private DateTime _lastLimitUpdate = DateTime.MinValue;
     private double _correctionThrottle = 1.0;
+
+    private readonly Queue<bool> _failureWindow = new(100);
 
     public AdaptiveConcurrencyManager(int initial, int min, int max)
     {
         _currentLimit = initial;
         _minLimit = min;
         _maxLimit = max;
-        _semaphore = new SemaphoreSlim(max); // Initialize with max to handle dynamic adjustment
-        for (int i = 0; i < max - initial; i++) _semaphore.Wait(); // Drain to initial
+        _semaphore = new SemaphoreSlim(initial, max);
     }
 
     public void ApplyGlobalThrottle(double multiplier)
@@ -387,50 +371,68 @@ public class AdaptiveConcurrencyManager
     }
 
     public async Task WaitAsync() => await _semaphore.WaitAsync();
-    public void Release() => _semaphore.Release();
+    
+    public void Release()
+    {
+        lock (_lock)
+        {
+            if (_reductionDeficit > 0)
+            {
+                _reductionDeficit--;
+                return; // Do not release, effectively shrinking the pool
+            }
+        }
+        _semaphore.Release();
+    }
 
     public void RecordResult(bool success, string failureType = "None")
     {
         lock (_lock)
         {
-            // Task 1: Convert metrics into control signals
-            // Only update every 500ms to avoid oscillation
-            if (DateTime.UtcNow - _lastLimitUpdate < TimeSpan.FromMilliseconds(500)) return;
+            _failureWindow.Enqueue(success);
+            if (_failureWindow.Count > 100) _failureWindow.Dequeue();
 
-            if (success)
+            double failureRate = (double)_failureWindow.Count(x => !x) / _failureWindow.Count;
+
+            // Progressive Failure Response System
+            if (failureRate > 0.15 || !success) // Start reacting if window > 15% or immediate failure
             {
-                _consecutiveSuccesses++;
-                if (_consecutiveSuccesses >= 10 && _currentLimit < (_maxLimit * _correctionThrottle))
+                _consecutiveSuccesses = 0;
+                
+                // Exponential reduction based on failure severity
+                double pressure = failureType switch {
+                    "RateLimited" => 0.20, // 20% drop
+                    "DNSError" => 0.10,    // 10% drop
+                    _ => 0.05              // 5% drop
+                };
+
+                int reduction = (int)Math.Max(1, _currentLimit * pressure);
+                
+                if (_currentLimit > _minLimit && (DateTime.UtcNow - _lastLimitUpdate).TotalMilliseconds > 200)
                 {
-                    _currentLimit++;
-                    _semaphore.Release(); // Increase capacity
-                    _consecutiveSuccesses = 0;
+                    int newLimit = Math.Max(_minLimit, _currentLimit - reduction);
+                    // Efficiently shrink capacity by tracking deficit for the Release() method
+                    _reductionDeficit += (_currentLimit - newLimit);
+                    _currentLimit = newLimit;
                     _lastLimitUpdate = DateTime.UtcNow;
                 }
             }
-            else
+            else if (success && failureRate < 0.05)
             {
-                _consecutiveSuccesses = 0;
-                // Aggressive backpressure for rate limits or high latency
-                int reduction = (failureType == "RateLimited") ? 5 : 1;
-                
-                if (_currentLimit > _minLimit)
+                // Smooth Recovery
+                _consecutiveSuccesses++;
+                if (_consecutiveSuccesses >= 15 && _currentLimit < (_maxLimit * _correctionThrottle))
                 {
-                    int target = (int)Math.Max(_minLimit, _currentLimit - reduction);
-                    int diff = _currentLimit - target;
-                    for (int i = 0; i < diff; i++) 
-                    {
-                        // Drain capacity asynchronously if possible, or just wait next time
-                        Task.Run(() => _semaphore.WaitAsync());
-                    }
-                    _currentLimit = target;
+                    _currentLimit++;
+                    _semaphore.Release();
+                    _consecutiveSuccesses = 0;
                     _lastLimitUpdate = DateTime.UtcNow;
                 }
             }
         }
     }
 
-    public int CurrentLimit => (int)(_currentLimit * _correctionThrottle);
+    public double PressureRatio => 1.0 - (double)(_currentLimit - _minLimit) / (_maxLimit - _minLimit);
 }
 
 public class DomainThrottle
